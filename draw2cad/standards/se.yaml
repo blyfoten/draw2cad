@@ -1,0 +1,28 @@
+# Typical Swedish dimensions used as priors (all values in mm).
+#
+# STATUS: starting values, NOT verified against the standards themselves.
+# Check these against SS 91 42 21 / BBR / supplier data before relying on them,
+# and expect older buildings to differ (add per-era overrides when needed).
+
+doors:
+  # Module M = 100 mm. Opening size = modules * 100 + 10, as stated in the
+  # legend of sample drawing A-40-1-100 (10M = 1010 mm, 9M = 910 mm).
+  opening_rule: "modules * 100 + 10"
+  interior_modules: [7, 8, 9, 10]
+  exterior_modules: [10, 11, 12]
+  height_modules: [20, 21]
+
+windows:
+  # Window sizes are written width/height in modules, e.g. "10/15" = 1000 x 1500.
+  width_modules: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18]
+
+walls:
+  interior_nonbearing: [70, 95, 120]   # stud 45/70/95 + 2 x 13 gypsum
+  interior_bearing: [145, 195, 245]
+  exterior: [250, 300, 350, 400, 450]
+
+grid:
+  # Coordinates of reconstructed geometry are snapped to this grid.
+  snap_mm: 5
+  # Overall building dimensions are usually multiples of this.
+  building_module_mm: 100

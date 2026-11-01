@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>draw2cad</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2430; --muted: #667085; --line: #e3e7ee;
+    --accent: #0f766e; --accent-ink: #ffffff; --warn-bg: #fff7e6; --warn-ink: #8a5300;
+    --err-bg: #fdecec; --err-ink: #9b1c1c; --canvas: #eef1f5;
+    --wall_ext: #0e7490; --wall_int: #15803d; --door: #c2410c; --window: #a21caf;
+    --room: #1d4ed8; --dimension: #b91c1c; --text: #475569; --other: #7c8798;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12161c; --panel: #1a2029; --ink: #e6eaf0; --muted: #98a2b3; --line: #2b3340;
+      --accent: #2dd4bf; --accent-ink: #062b28; --warn-bg: #3a2c10; --warn-ink: #f5c26b;
+      --err-bg: #3b1717; --err-ink: #f8a5a5; --canvas: #0d1117;
+      --wall_ext: #22d3ee; --wall_int: #4ade80; --door: #fb923c; --window: #e879f9;
+      --room: #60a5fa; --dimension: #f87171; --text: #cbd5e1; --other: #8b95a5;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); background: var(--bg);
+         display: grid; grid-template-rows: auto 1fr; }
+  header { display: flex; align-items: center; gap: 16px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
+  header h1 span { color: var(--accent); }
+  header .spacer { flex: 1; }
+  button, .btn { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 8px;
+                 padding: 6px 12px; cursor: pointer; }
+  button:hover, .btn:hover { border-color: var(--muted); }
+  button.primary, .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  label.toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); cursor: pointer; }
+  main { display: grid; grid-template-columns: 1fr 340px; min-height: 0; }
+  #viewer { position: relative; overflow: hidden; background: var(--canvas); cursor: grab; }
+  #viewer.dragging { cursor: grabbing; }
+  #viewer.calibrating { cursor: crosshair; }
+  #stage { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  #stage img { display: block; user-select: none; -webkit-user-drag: none; }
+  #stage svg { position: absolute; left: 0; top: 0; overflow: visible; }
+  #empty { position: absolute; inset: 24px; border: 2px dashed var(--line); border-radius: 16px; display: grid; place-items: center;
+           text-align: center; color: var(--muted); background: var(--panel); }
+  #empty.over { border-color: var(--accent); }
+  #empty h2 { color: var(--ink); font-size: 20px; margin: 0 0 6px; }
+  #busy { position: absolute; inset: 0; display: none; place-items: center; background: color-mix(in srgb, var(--canvas) 80%, transparent); }
+  #busy.on { display: grid; }
+  .spinner { width: 36px; height: 36px; border-radius: 50%; border: 3px solid var(--line); border-top-color: var(--accent);
+             animation: spin 0.9s linear infinite; margin: 0 auto 12px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #zoombar { position: absolute; right: 12px; bottom: 12px; display: flex; gap: 6px; }
+  #zoombar button { padding: 4px 10px; }
+  aside { background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; padding: 14px 16px 24px; }
+  aside section { padding: 12px 0; border-bottom: 1px solid var(--line); }
+  aside section:last-child { border-bottom: 0; }
+  aside h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 8px; }
+  .big { font-size: 20px; font-weight: 650; }
+  .muted { color: var(--muted); }
+  .small { font-size: 12px; }
+  .badge { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); }
+  .bar { height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; margin: 6px 0; }
+  .bar > div { height: 100%; background: var(--accent); }
+  .layer { display: grid; grid-template-columns: 18px 14px 1fr auto; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer; }
+  .layer .sw { width: 14px; height: 14px; border-radius: 3px; }
+  .layer .nm { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .layer .ds { color: var(--muted); font-size: 12px; }
+  .rooms { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; font-size: 13px; }
+  .note { border-radius: 8px; padding: 8px 10px; margin: 6px 0; font-size: 13px; }
+  .note.warn { background: var(--warn-bg); color: var(--warn-ink); }
+  .note.err { background: var(--err-bg); color: var(--err-ink); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  input[type=number] { font: inherit; width: 110px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  ul.notes { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: var(--muted); }
+  ol.agentlog { margin: 8px 0 0; padding-left: 18px; font-size: 12.5px; max-height: 320px; overflow-y: auto; }
+  ol.agentlog li { margin: 3px 0; }
+  ol.agentlog li.tool { color: var(--muted); list-style: none; margin-left: -18px; }
+  ol.agentlog li.tool span { font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
+  ol.agentlog li.err { color: var(--err-ink); }
+  .hidden { display: none !important; }
+  @media (prefers-color-scheme: dark) {
+    #stage img { filter: invert(1) hue-rotate(180deg); }  /* white paper becomes dark, ink stays readable */
+  }
+  @media (max-width: 820px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 60vh auto; }
+    aside { border-left: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>draw<span>2</span>cad</h1>
+  <button class="primary" id="open">Open drawing…</button>
+  <input type="file" id="file" accept=".pdf,image/*" hidden>
+  <label class="toggle" title="Let Claude read the sheet (scale note, overall dimensions, room names)">
+    <input type="checkbox" id="useai" checked> AI assist</label>
+  <span id="pagepick" class="hidden muted small">Page <input type="number" id="page" min="1" value="1" style="width:60px"></span>
+  <div class="spacer"></div>
+  <span id="fname" class="muted small"></span>
+</header>
+<main>
+  <div id="viewer">
+    <div id="stage"><img id="img" alt=""><svg id="svg"></svg></div>
+    <div id="empty">
+      <div>
+        <h2>Drop a floor plan here</h2>
+        <div>PDF, JPG, PNG or TIFF: scans, phone photos or printed-to-PDF drawings.</div>
+        <div class="small" style="margin-top:10px">Everything runs on this computer; only the optional AI assist sends the image to Claude.</div>
+        <div style="margin-top:16px"><button class="primary" id="open2">Choose file…</button></div>
+      </div>
+    </div>
+    <div id="busy"><div><div class="spinner"></div><div id="busytext">Reading the drawing…</div></div></div>
+    <div id="zoombar" class="hidden"><button id="zin">+</button><button id="zout">−</button><button id="zfit">Fit</button></div>
+  </div>
+  <aside id="side">
+    <section>
+      <h3>Get started</h3>
+      <div class="muted">Open a drawing to convert it. You'll see every recognised wall, door, window and room over the original, and can fix the scale before downloading the DXF.</div>
+    </section>
+  </aside>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const LAYER_INFO = {
+  wall_ext: "Exterior walls", wall_int: "Interior walls", door: "Doors", window: "Windows",
+  room: "Rooms", dimension: "Dimensions", text: "Text", other: "Furniture & fixtures",
+};
+let job = null;           // last /api response
+let visible = new Set(["wall_ext", "wall_int", "door", "window", "room", "dimension", "text", "other"]);
+let view = { x: 0, y: 0, k: 1 };
+let calib = null;         // {p1, p2} while calibrating
+let imgOpacity = 0.55;
+
+// ---------- upload ----------
+$("open").onclick = $("open2").onclick = () => $("file").click();
+$("file").onchange = (e) => e.target.files[0] && upload(e.target.files[0]);
+const viewer = $("viewer");
+["dragenter", "dragover"].forEach(ev => viewer.addEventListener(ev, (e) => { e.preventDefault(); $("empty").classList.add("over"); }));
+["dragleave", "drop"].forEach(ev => viewer.addEventListener(ev, (e) => { e.preventDefault(); $("empty").classList.remove("over"); }));
+viewer.addEventListener("drop", (e) => e.dataTransfer.files[0] && upload(e.dataTransfer.files[0]));
+
+let lastFile = null;
+async function upload(file) {
+  lastFile = file;
+  clearTimeout(agentTimer);
+  agentState = { running: false, events: [], version: 0 };
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("use_ai", $("useai").checked);
+  fd.append("page", Math.max(0, (+$("page").value || 1) - 1));
+  $("fname").textContent = file.name;
+  busy(true, $("useai").checked ? "Reading the drawing (OCR and AI)…" : "Reading the drawing…");
+  try {
+    const r = await fetch("/api/convert", { method: "POST", body: fd });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    show(await r.json(), true);
+  } catch (err) {
+    busy(false);
+    renderError(err.message);
+  }
+}
+$("page").onchange = () => lastFile && upload(lastFile);
+
+function busy(on, text) {
+  $("busy").classList.toggle("on", on);
+  if (on) $("empty").classList.add("hidden");
+  else if (!job) $("empty").classList.remove("hidden");
+  if (text) $("busytext").textContent = text;
+}
+
+// ---------- rendering ----------
+function show(data, fresh) {
+  job = data;
+  $("empty").classList.add("hidden");
+  $("zoombar").classList.remove("hidden");
+  $("pagepick").classList.toggle("hidden", data.pages <= 1);
+  const img = $("img");
+  const done = () => { busy(false); if (fresh) fit(); draw(); renderSide(); };
+  if (fresh) {
+    img.onload = done;
+    img.src = `/api/jobs/${data.id}/image.png`;
+    img.style.width = data.width + "px";
+    img.style.height = data.height + "px";
+  } else done();
+  img.style.opacity = imgOpacity;
+  const svg = $("svg");
+  svg.setAttribute("width", data.width);
+  svg.setAttribute("height", data.height);
+  svg.setAttribute("viewBox", `0 0 ${data.width} ${data.height}`);
+}
+
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+const pts = (ring) => ring.map(p => p.join(",")).join(" ");
+
+function draw() {
+  const svg = $("svg");
+  svg.innerHTML = "";
+  if (!job) return;
+  const ov = job.overlay;
+  const order = ["other", "room", "wall_int", "wall_ext", "window", "door", "dimension", "text"];
+  const sw = 1.6 / view.k;  // keep strokes ~1.6 screen px at any zoom
+  for (const key of order) {
+    if (!visible.has(key)) continue;
+    const color = `var(--${key})`;
+    const g = el("g", { "data-layer": key }, svg);
+    for (const item of ov[key] || []) {
+      if (item.type === "poly") {
+        const d = item.rings.map(r => "M" + r.map(p => p.join(",")).join("L") + "Z").join("");
+        el("path", { d, fill: color, "fill-opacity": 0.35, stroke: color, "stroke-width": sw, "fill-rule": "evenodd" }, g);
+      } else if (item.type === "door") {
+        const [hx, hy] = item.hinge, [lx, ly] = item.leaf, [cx, cy] = item.closed;
+        const cross = (lx - hx) * (cy - hy) - (ly - hy) * (cx - hx);
+        el("line", { x1: hx, y1: hy, x2: lx, y2: ly, stroke: color, "stroke-width": sw * 1.3 }, g);
+        el("path", { d: `M${lx},${ly} A${item.r},${item.r} 0 0 ${cross > 0 ? 1 : 0} ${cx},${cy}`,
+                     fill: "none", stroke: color, "stroke-width": sw, "stroke-dasharray": `${4 / view.k},${3 / view.k}` }, g);
+      } else if (item.type === "lines") {
+        for (const s of item.segs) el("polyline", { points: pts(s), fill: "none", stroke: color, "stroke-width": key === "other" ? sw * 0.7 : sw }, g);
+      } else if (item.type === "room") {
+        el("polygon", { points: pts(item.ring), fill: color, "fill-opacity": 0.06, stroke: color, "stroke-width": sw * 0.6,
+                        "stroke-dasharray": `${6 / view.k},${4 / view.k}` }, g);
+        // Label size follows the room (fits inside it) but never exceeds 13 screen px.
+        const xs = item.ring.map(p => p[0]), ys = item.ring.map(p => p[1]);
+        const roomW = Math.max(...xs) - Math.min(...xs);
+        const fs = Math.min(13 / view.k, roomW / Math.max(4, item.name.length * 0.62), (Math.max(...ys) - Math.min(...ys)) / 3);
+        const t = el("text", { x: item.at[0], y: item.at[1], "text-anchor": "middle", fill: color, "font-size": fs, "font-weight": 650 }, g);
+        t.textContent = item.name;
+        const a = el("text", { x: item.at[0], y: item.at[1] + fs * 1.2, "text-anchor": "middle", fill: color, "font-size": fs * 0.85 }, g);
+        a.textContent = `${item.area.toString().replace(".", ",")} m²`;
+      } else if (item.type === "text") {
+        const t = el("text", { x: item.at[0], y: item.at[1], "text-anchor": "middle", "dominant-baseline": "middle", fill: color,
+                               "font-size": Math.max(item.size, 6), transform: item.angle ? `rotate(${-item.angle} ${item.at[0]} ${item.at[1]})` : "" }, g);
+        t.textContent = item.text;
+      } else if (item.type === "dim") {
+        el("line", { x1: item.p[0], y1: item.p[1], x2: item.q[0], y2: item.q[1], stroke: color, "stroke-width": sw }, g);
+        for (const e of [item.e1, item.e2]) el("polyline", { points: pts(e), fill: "none", stroke: color, "stroke-width": sw * 0.6 }, g);
+        const mx = (item.p[0] + item.q[0]) / 2, my = (item.p[1] + item.q[1]) / 2;
+        const vertical = Math.abs(item.p[0] - item.q[0]) < 1;
+        const t = el("text", { x: mx, y: my - 5 / view.k, "text-anchor": "middle", fill: color, "font-size": 13 / view.k, "font-weight": 600,
+                               transform: vertical ? `rotate(-90 ${mx} ${my})` : "" }, g);
+        t.textContent = item.label;
+      }
+    }
+  }
+  if (calib) {
+    const g = el("g", {}, svg);
+    const r = 5 / view.k;
+    for (const p of [calib.p1, calib.p2].filter(Boolean)) el("circle", { cx: p[0], cy: p[1], r, fill: "var(--accent)" }, g);
+    if (calib.p1 && calib.p2) el("line", { x1: calib.p1[0], y1: calib.p1[1], x2: calib.p2[0], y2: calib.p2[1], stroke: "var(--accent)", "stroke-width": 2 / view.k }, g);
+  }
+}
+
+function fmtScale(s) { return s.toFixed(s < 1 ? 4 : 3); }
+
+function renderSide() {
+  const j = job, s = j.scale;
+  const conf = Math.round(s.confidence * 100);
+  const sameAxes = Math.abs(s.sx / s.sy - 1) < 0.002;
+  const userSet = s.source === "user";
+  const aiLine = !j.ai.enabled ? `<span class="muted">Off</span>`
+    : j.ai.ok ? `Used. <span class="muted">${esc(j.ai.drawing_type || "")}${j.ai.notes ? " · " + esc(j.ai.notes) : ""}</span>`
+    : `<span class="muted">Unavailable: ${esc(j.ai.error || "unknown error")}. Conversion ran with local OCR only.</span>`;
+  $("side").innerHTML = `
+    <section>
+      <h3>Download</h3>
+      <div class="row">
+        <a class="btn primary" id="dl" href="/api/jobs/${j.id}/drawing.dxf">Download DXF</a>
+        <label class="toggle small"><input type="checkbox" id="dlvis"> only visible layers</label>
+      </div>
+      <div class="small muted" style="margin-top:6px">Millimetres, 1 unit = 1 mm. Open in AutoCAD, BricsCAD, LibreCAD or QCAD; save as DWG from there.</div>
+    </section>
+    ${j.warnings.map(w => `<div class="note warn">${esc(w)}</div>`).join("")}
+    <section>
+      <h3>Scale</h3>
+      <div class="big">1 px = ${fmtScale(s.sx)} mm${sameAxes ? "" : ` <span class="small muted">× ${fmtScale(s.sy)} mm</span>`}</div>
+      <div class="row small"><span class="badge">${esc(s.source)}</span><span class="muted">confidence ${conf}%</span></div>
+      <div class="bar"><div style="width:${conf}%"></div></div>
+      <div class="row" style="margin-top:8px">
+        <button id="calbtn">${calib ? "Cancel calibration" : "Calibrate…"}</button>
+        ${userSet ? `<button id="resetbtn">Use automatic scale</button>` : ""}
+      </div>
+      <div id="calpanel" class="${calib ? "" : "hidden"}" style="margin-top:10px">
+        <div class="small">${!calib || !calib.p1 ? "Click the first point of a known distance (e.g. one end of a dimension line)."
+          : !calib.p2 ? "Click the second point." : "Enter the real distance between the points:"}</div>
+        <div class="row ${calib && calib.p2 ? "" : "hidden"}" style="margin-top:6px">
+          <input type="number" id="calmm" placeholder="mm" min="1"> <span class="muted">mm</span>
+          <button class="primary" id="calgo">Apply</button>
+        </div>
+      </div>
+      <details style="margin-top:8px"><summary>How the scale was found</summary>
+        <ul class="notes">${s.notes.map(n => `<li>${esc(n)}</li>`).join("") || "<li>No notes</li>"}</ul></details>
+    </section>
+    <section>
+      <h3>Layers</h3>
+      ${j.layers.map(l => `
+        <label class="layer" title="${esc(LAYER_INFO[l.key] || "")}">
+          <input type="checkbox" data-key="${l.key}" ${visible.has(l.key) ? "checked" : ""}>
+          <span class="sw" style="background:var(--${l.key})"></span>
+          <span><span class="nm">${esc(l.name)}</span> <span class="ds">${esc(LAYER_INFO[l.key] || "")}</span></span>
+          <span class="muted small">${l.count}</span>
+        </label>`).join("")}
+      <div style="margin-top:10px" class="small muted">Original drawing opacity</div>
+      <input type="range" id="opacity" min="0" max="1" step="0.05" value="${imgOpacity}">
+    </section>
+    <section>
+      <h3>Rooms</h3>
+      ${j.rooms.length ? `<div class="rooms">${j.rooms.map(r => `<span>${esc(r.name)}</span><span class="muted">${r.area.toString().replace(".", ",")} m²</span>`).join("")}</div>`
+        : `<div class="muted small">No closed rooms found.</div>`}
+    </section>
+    <section>
+      <h3>AI agent</h3>
+      <div class="small muted">Claude Opus looks at the result over the drawing, tunes the conversion and fixes what it
+        can, step by step. Takes a few minutes.</div>
+      <div class="row" style="margin-top:8px">
+        <select id="backend" ${agentState.running ? "disabled" : ""} style="font:inherit;padding:5px 8px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--ink)">
+          <option value="claude-code" ${backendChoice === "claude-code" ? "selected" : ""} ${server.claude_code?.available ? "" : "disabled"}>Claude Code (your subscription)</option>
+          <option value="api" ${backendChoice === "api" ? "selected" : ""} ${server.ai_available ? "" : "disabled"}>Anthropic API (credits)</option>
+        </select>
+        <button class="primary" id="agentbtn" ${agentState.running ? "disabled" : ""}>${agentState.running ? "Agent working…" : "Improve with AI agent"}</button>
+        ${agentState.cost_usd != null ? `<span class="muted small">~$${agentState.cost_usd}</span>` : ""}
+      </div>
+      <div class="small muted" style="margin-top:4px">${server.claude_code?.available
+        ? `Claude Code: logged in as ${esc(server.claude_code.account || "")}; usage counts against your plan's limits.`
+        : `Claude Code not usable: ${esc(server.claude_code?.reason || "unknown")}.`}</div>
+      ${agentState.summary ? `<div class="note ${agentState.quality === "poor" ? "warn" : ""}" style="background:var(--bg)"><b>${esc(agentState.quality || "")}</b>: ${md(agentState.summary)}</div>` : ""}
+      <ol class="agentlog" id="agentlog">${agentState.events.map(fmtEvent).join("")}</ol>
+    </section>
+    <section>
+      <h3>AI assist</h3>
+      <div class="small">${aiLine}</div>
+    </section>
+    <section>
+      <h3>Drawing</h3>
+      <div class="small muted">${j.width} × ${j.height} px · walls look ${esc(j.style)} · straightened ${j.skew}° ·
+        ${Object.entries(j.timings).map(([k, v]) => `${k} ${v}s`).join(", ")}</div>
+    </section>`;
+
+  $("dlvis").onchange = updateDownloadLink;
+  updateDownloadLink();
+  $("agentbtn").onclick = startAgent;
+  $("backend").onchange = (e) => { backendChoice = e.target.value; };
+  const log = $("agentlog");
+  if (log) log.scrollTop = log.scrollHeight;
+  $("side").querySelectorAll(".layer input").forEach(cb => cb.onchange = () => {
+    cb.checked ? visible.add(cb.dataset.key) : visible.delete(cb.dataset.key);
+    draw(); updateDownloadLink();
+  });
+  $("opacity").oninput = (e) => { imgOpacity = +e.target.value; $("img").style.opacity = imgOpacity; };
+  $("calbtn").onclick = () => { calib = calib ? null : {}; viewer.classList.toggle("calibrating", !!calib); renderSide(); draw(); };
+  if ($("resetbtn")) $("resetbtn").onclick = () => rescale(`/api/jobs/${job.id}/reset-scale`, null);
+  if ($("calgo")) {
+    $("calmm").focus();
+    $("calmm").onkeydown = (e) => e.key === "Enter" && $("calgo").click();
+    $("calgo").onclick = () => {
+      const mm = +$("calmm").value;
+      if (!(mm > 0)) return;
+      rescale(`/api/jobs/${job.id}/calibrate`, { p1: calib.p1, p2: calib.p2, mm });
+    };
+  }
+}
+
+// ---------- agent ----------
+let agentState = { running: false, events: [], version: 0 };
+let agentTimer = null;
+let server = {};          // /api/status: which agent backends are usable
+let backendChoice = "api";
+
+function fmtEvent(e) {
+  if (e.type === "say") return `<li>${esc(e.text)}</li>`;
+  if (e.type === "tool") {
+    const args = Object.entries(e.input || {}).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(", ");
+    const label = { view_drawing: "looks at the drawing", run_conversion: "runs the conversion", read_text: "reads text",
+                    list_pens: "lists PDF pens", view_pens: "looks at PDF pens", edit_plan: `edits the plan (${e.actions} changes)`,
+                    finish: "finishes" }[e.name] || e.name;
+    return `<li class="tool">→ ${esc(label)}${args && e.name !== "finish" ? ` <span>${esc(args)}</span>` : ""}</li>`;
+  }
+  if (e.type === "error") return `<li class="err">${esc(e.text)}</li>`;
+  return "";
+}
+
+async function startAgent() {
+  const r = await fetch(`/api/jobs/${job.id}/agent?backend=${backendChoice}`, { method: "POST" });
+  if (!r.ok) { alert((await r.json()).detail || r.statusText); return; }
+  agentState = { running: true, events: [], version: 0 };
+  renderSide();
+  pollAgent();
+}
+
+async function pollAgent() {
+  clearTimeout(agentTimer);
+  const r = await fetch(`/api/jobs/${job.id}/agent?since=${agentState.events.length}`);
+  if (!r.ok) return;
+  const s = await r.json();
+  const changed = s.version !== agentState.version;
+  agentState = { ...s, events: agentState.events.concat(s.events) };
+  if (changed) {  // a new reconstruction: redraw it
+    const j = await fetch(`/api/jobs/${job.id}`).then(x => x.json());
+    show(j, false);
+  } else if (s.events.length) {
+    renderSide();
+  }
+  if (s.running) agentTimer = setTimeout(pollAgent, 1500);
+}
+
+function updateDownloadLink() {
+  const a = $("dl");
+  if (!a) return;
+  a.href = `/api/jobs/${job.id}/drawing.dxf` + ($("dlvis").checked ? `?layers=${[...visible].join(",")}` : "");
+}
+
+async function rescale(url, body) {
+  busy(true, "Recalculating with the new scale…");
+  try {
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : null });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    calib = null;
+    viewer.classList.remove("calibrating");
+    show(await r.json(), false);
+  } catch (err) {
+    busy(false);
+    alert(err.message);
+  }
+}
+
+function renderError(msg) {
+  $("side").innerHTML = `<section><h3>Something went wrong</h3><div class="note err">${esc(msg)}</div></section>`;
+}
+function md(s) {  // the agent writes light Markdown: bold and line breaks are enough
+  return esc(s).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/\n/g, "<br>");
+}
+function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+// ---------- pan / zoom / calibration clicks ----------
+function apply() { $("stage").style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.k})`; }
+function fit() {
+  if (!job) return;
+  const r = viewer.getBoundingClientRect();
+  view.k = Math.min(r.width / job.width, r.height / job.height) * 0.95;
+  view.x = (r.width - job.width * view.k) / 2;
+  view.y = (r.height - job.height * view.k) / 2;
+  apply(); draw();
+}
+function zoomAt(f, cx, cy) {
+  const k = Math.min(20, Math.max(0.05, view.k * f));
+  view.x = cx - (cx - view.x) * (k / view.k);
+  view.y = cy - (cy - view.y) * (k / view.k);
+  view.k = k;
+  apply(); draw();
+}
+viewer.addEventListener("wheel", (e) => {
+  if (!job) return;
+  e.preventDefault();
+  const r = viewer.getBoundingClientRect();
+  zoomAt(Math.exp(-e.deltaY * 0.0015), e.clientX - r.left, e.clientY - r.top);
+}, { passive: false });
+$("zin").onclick = () => { const r = viewer.getBoundingClientRect(); zoomAt(1.3, r.width / 2, r.height / 2); };
+$("zout").onclick = () => { const r = viewer.getBoundingClientRect(); zoomAt(1 / 1.3, r.width / 2, r.height / 2); };
+$("zfit").onclick = fit;
+window.addEventListener("resize", () => job && fit());
+
+let drag = null;
+viewer.addEventListener("pointerdown", (e) => {
+  if (!job || e.target.closest("#zoombar")) return;
+  drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y, moved: false };
+  viewer.setPointerCapture(e.pointerId);
+});
+viewer.addEventListener("pointermove", (e) => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  if (Math.abs(dx) + Math.abs(dy) > 3) { drag.moved = true; viewer.classList.add("dragging"); }
+  if (drag.moved) { view.x = drag.vx + dx; view.y = drag.vy + dy; apply(); }
+});
+viewer.addEventListener("pointerup", (e) => {
+  const d = drag; drag = null; viewer.classList.remove("dragging");
+  if (!d || d.moved || !calib) return;
+  const r = viewer.getBoundingClientRect();
+  const p = [(e.clientX - r.left - view.x) / view.k, (e.clientY - r.top - view.y) / view.k];
+  if (!calib.p1 || calib.p2) { calib = { p1: p }; } else { calib.p2 = p; }
+  draw(); renderSide();
+});
+
+fetch("/api/status").then(r => r.json()).then(s => {
+  server = s;
+  backendChoice = s.claude_code?.available ? "claude-code" : "api";
+  if (!s.ai_available) { $("useai").checked = false; $("useai").parentElement.title = "No ANTHROPIC_API_KEY configured"; }
+}).catch(() => {});
+</script>
+</body>
+</html>

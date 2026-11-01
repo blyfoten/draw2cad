@@ -1,0 +1,19 @@
+# Known facts about the real sample drawings, used as partial ground truth (mm).
+# footprints: outer width/depth of a building's exterior walls, from the drawing's own dimensions.
+
+Typritning_A-40-1-100.jpg:
+  scale: 100
+  footprints:
+    - name: PLAN 1 BOTTENPLAN
+      width: 13400   # dimensioned: 13 400 overall, chain 3 300 + 5 200 + 4 900
+      depth: 8000    # dimensioned: 8 000
+
+Typritning_A-40-1-110.jpg:
+  scale: 100
+  footprints:
+    - name: PLAN (main house)
+      width: 13400   # not dimensioned on this sheet; same house as A-40-1-100
+      depth: 8000
+
+villa-sandstrom-planritning.width-1000.jpg: {}   # no overall dimensions printed; smoke test only
+IMG_6131.png: {}                                 # smoke test only
