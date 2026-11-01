@@ -24,6 +24,7 @@ from pathlib import Path
 
 from draw2cad.agent import MODEL, SYSTEM, TOOLS, Event, Session
 from draw2cad.convert import Prepared
+from draw2cad.feedback import FeedbackLog
 
 TIME_LIMIT_S = 20 * 60
 
@@ -57,7 +58,9 @@ def _child_env() -> dict:
 
 
 def run_agent_claude_code(prep: Prepared, on_event: Event | None = None, session: Session | None = None,
-                          time_limit_s: int = TIME_LIMIT_S) -> Session:
+                          time_limit_s: int = TIME_LIMIT_S, drawing: str = "drawing") -> Session:
+    """The agent's feedback (issue reports, fixes, crops) goes to a new folder under feedback/,
+    written by the MCP server process."""
     exe = claude_cli()
     if not exe:
         raise RuntimeError("the claude CLI is not installed")
@@ -67,9 +70,12 @@ def run_agent_claude_code(prep: Prepared, on_event: Event | None = None, session
     state_dir = work / "state"
     with open(work / "prep.pkl", "wb") as f:
         pickle.dump(prep, f)
+    fb_dir = FeedbackLog(drawing, "claude-code").dir  # created here so the caller knows where it is
+    session.feedback_dir = fb_dir  # type: ignore[attr-defined]
     config = {"mcpServers": {"draw2cad": {
         "command": sys.executable,
-        "args": ["-m", "draw2cad.mcp_server", "--prepared", str(work / "prep.pkl"), "--state", str(state_dir)]}}}
+        "args": ["-m", "draw2cad.mcp_server", "--prepared", str(work / "prep.pkl"), "--state", str(state_dir),
+                 "--feedback", str(fb_dir), "--drawing", drawing]}}}
     (work / "mcp.json").write_text(json.dumps(config), encoding="utf-8")
 
     page = prep.page
@@ -148,6 +154,9 @@ def run_agent_claude_code(prep: Prepared, on_event: Event | None = None, session
         emit({"type": "error", "text": f"Claude Code: {reason}"})
     if session.result is None:
         session.run()
+    FeedbackLog(drawing, "claude-code", folder=fb_dir).write(
+        {"event": "usage", "backend": "claude-code", "usage": final.get("usage", {}),
+         "duration_s": round(final.get("duration_ms", 0) / 1000), "turns": final.get("num_turns")})
     emit({"type": "done", "summary": (session.done or {}).get("summary", final.get("result") or "Stopped."),
           "quality": (session.done or {}).get("quality", "unknown"), "usage": final.get("usage", {}),
           "cost_usd": None, "backend": "claude-code"})

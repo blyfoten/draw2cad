@@ -20,6 +20,7 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
 from draw2cad.agent import SYSTEM, TOOLS, Session, run_tool
+from draw2cad.feedback import FeedbackLog
 
 CHANGES = {"run_conversion", "edit_plan", "finish"}
 
@@ -64,9 +65,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--prepared", type=Path, required=True)
     ap.add_argument("--state", type=Path, required=True)
+    ap.add_argument("--feedback", type=Path, help="folder for issue reports and fix crops (feedback.py)")
+    ap.add_argument("--drawing", default="drawing", help="drawing name for the feedback log")
     args = ap.parse_args()
     with open(args.prepared, "rb") as f:
         session = Session(pickle.load(f))
+    if args.feedback:
+        session.feedback = FeedbackLog(args.drawing, "claude-code", folder=args.feedback)
     args.state.mkdir(parents=True, exist_ok=True)
     server = build_server(session, args.state)
 

@@ -333,6 +333,8 @@ function renderSide() {
         ? `Claude Code: logged in as ${esc(server.claude_code.account || "")}; usage counts against your plan's limits.`
         : `Claude Code not usable: ${esc(server.claude_code?.reason || "unknown")}.`}</div>
       ${agentState.summary ? `<div class="note ${agentState.quality === "poor" ? "warn" : ""}" style="background:var(--bg)"><b>${esc(agentState.quality || "")}</b>: ${md(agentState.summary)}</div>` : ""}
+      ${agentState.feedback_dir ? `<div class="small muted">Tool feedback and problem crops saved in <code>${esc(agentState.feedback_dir)}</code>
+        (summary: <code>python -m draw2cad.feedback</code>).</div>` : ""}
       <ol class="agentlog" id="agentlog">${agentState.events.map(fmtEvent).join("")}</ol>
     </section>
     <section>
@@ -381,7 +383,7 @@ function fmtEvent(e) {
     const args = Object.entries(e.input || {}).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(", ");
     const label = { view_drawing: "looks at the drawing", run_conversion: "runs the conversion", read_text: "reads text",
                     list_pens: "lists PDF pens", view_pens: "looks at PDF pens", edit_plan: `edits the plan (${e.actions} changes)`,
-                    finish: "finishes" }[e.name] || e.name;
+                    report_issue: "reports a tool problem", list_items: "lists items", finish: "finishes" }[e.name] || e.name;
     return `<li class="tool">→ ${esc(label)}${args && e.name !== "finish" ? ` <span>${esc(args)}</span>` : ""}</li>`;
   }
   if (e.type === "error") return `<li class="err">${esc(e.text)}</li>`;

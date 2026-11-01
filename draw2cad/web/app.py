@@ -28,6 +28,7 @@ from draw2cad import agent_cc, ai
 from draw2cad.agent import Session, run_agent
 from draw2cad.convert import Options, Prepared, Result, analyze_prepared, prepare
 from draw2cad.dxf import door_symbol, iter_polygons, plan_to_dxf, window_symbol
+from draw2cad.feedback import FeedbackLog
 from draw2cad.layers import DEFAULT_LAYERS, Category
 
 STATIC = Path(__file__).parent / "static"
@@ -213,6 +214,8 @@ def get_job(jid: str):
 def _agent_thread(jid: str, job: Job, backend: str) -> None:
     state = job.agent
     session = Session(job.prep, params=deepcopy(job.opts.params), user_scale=job.opts.user_scale)
+    if backend == "api":  # the Claude Code backend's MCP server keeps its own feedback log
+        session.feedback = FeedbackLog(job.filename, "api")
 
     def on_event(e: dict) -> None:
         if e["type"] == "tool":  # keep the log readable: tool name plus its key arguments
@@ -227,7 +230,7 @@ def _agent_thread(jid: str, job: Job, backend: str) -> None:
 
     try:
         if backend == "claude-code":
-            agent_cc.run_agent_claude_code(job.prep, on_event, session=session)
+            agent_cc.run_agent_claude_code(job.prep, on_event, session=session, drawing=job.filename)
         else:
             run_agent(job.prep, on_event, session=session)
         job.result = session.result
@@ -236,6 +239,8 @@ def _agent_thread(jid: str, job: Job, backend: str) -> None:
     except Exception as e:
         state["events"].append({"type": "error", "text": f"{type(e).__name__}: {e}"})
     finally:
+        fb = session.feedback.dir if session.feedback else getattr(session, "feedback_dir", None)
+        state["feedback_dir"] = str(fb) if fb else None
         state["running"] = False
         state["version"] += 1
 
@@ -265,7 +270,7 @@ def agent_status(jid: str, since: int = 0):
     st = job.agent or {"running": False, "events": [], "version": 0}
     return {"running": st["running"], "events": st["events"][since:], "next": len(st["events"]),
             "version": st["version"], "summary": st.get("summary"), "quality": st.get("quality"),
-            "cost_usd": st.get("cost_usd"), "backend": st.get("backend")}
+            "cost_usd": st.get("cost_usd"), "backend": st.get("backend"), "feedback_dir": st.get("feedback_dir")}
 
 
 @app.get("/api/jobs/{jid}/image.png")

@@ -30,9 +30,10 @@ from draw2cad import ai
 from draw2cad.convert import (Options, Params, Prepared, Result, add_dimensions, add_rooms, analyze_prepared,
                               prepare, r5)
 from draw2cad.dxf import door_symbol, iter_polygons, plan_to_dxf, window_symbol
+from draw2cad.feedback import FeedbackLog, action_region, pad
 from draw2cad.ocr import parse_mm
 from draw2cad.plan import Opening, Wall
-from draw2cad.raster import render_vectors
+from draw2cad.raster import Page, render_region, render_vectors
 
 MODEL = ai.MODEL  # claude-opus-5-5
 VIEW_MAX = 1400  # px, long side of images sent to the model
@@ -71,20 +72,36 @@ def _crop_box(shape, region) -> tuple[int, int, int, int]:
     return x0, y0, x1, y1
 
 
+MAX_ZOOM = 8.0  # output px per page px when zoomed into a small region
+
+
 def render_view(res: Result | None, gray: np.ndarray, region=None, overlay: bool = True,
-                layers: set[str] | None = None, base: np.ndarray | None = None) -> tuple[bytes, str]:
+                layers: set[str] | None = None, base: np.ndarray | None = None,
+                page: Page | None = None) -> tuple[bytes, str]:
+    """A view of the page (or a region of it) with a page-px grid, optionally with the plan drawn on.
+    Small regions are enlarged to fill the view: vector PDFs are re-rendered from the PDF at that
+    resolution (real detail); scans are enlarged (no detail beyond the scan)."""
     x0, y0, x1, y1 = _crop_box(gray.shape, region)
-    src = gray if base is None else base
-    crop = src[y0:y1, x0:x1]
-    k = min(1.0, VIEW_MAX / max(crop.shape))
-    img = cv2.resize(crop, None, fx=k, fy=k, interpolation=cv2.INTER_AREA) if k < 1 else crop.copy()
+    k = min(MAX_ZOOM, VIEW_MAX / max(x1 - x0, y1 - y0))
+    detail = ""
+    img = None
+    if k > 1.05 and base is None and page is not None:
+        img = render_region(page, (x0, y0, x1, y1), k)
+        if img is not None:
+            detail = f"; re-rendered from the PDF vectors at {k:.1f}x (real detail)"
+    if img is None:
+        crop = (gray if base is None else base)[y0:y1, x0:x1]
+        interp = cv2.INTER_AREA if k < 1 else cv2.INTER_CUBIC
+        img = cv2.resize(crop, (int(round(crop.shape[1] * k)), int(round(crop.shape[0] * k))), interpolation=interp)
+        if k > 1.05:
+            detail = f"; enlarged {k:.1f}x from the scan (no detail beyond the scan's resolution)"
     img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     if overlay and res is not None:
         img = (img.astype(np.float32) * 0.55 + 115).astype(np.uint8)  # fade the drawing under the overlay
         draw_plan(img, res, x0, y0, k, layers)
     _grid(img, x0, y0, k)
     ok, png = cv2.imencode(".png", img)
-    caption = f"view of page px x {x0}..{x1}, y {y0}..{y1} (scale {k:.3f} image px per page px)"
+    caption = f"view of page px x {x0}..{x1}, y {y0}..{y1} (scale {k:.3f} image px per page px{detail})"
     return png.tobytes(), caption
 
 
@@ -123,6 +140,15 @@ def draw_plan(img: np.ndarray, res: Result, x0: float, y0: float, k: float, laye
         elif o.kind == "window" and "window" in on:
             for p, q in window_symbol(w, o):
                 cv2.line(img, P(p), P(q), COLORS["window"], 2)
+    if "ids" in on:
+        for w in plan.walls:
+            cx, cy = P(((w.a[0] + w.b[0]) / 2, (w.a[1] + w.b[1]) / 2))
+            cv2.putText(img, w.id, (cx + 3, cy - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 3)
+            cv2.putText(img, w.id, (cx + 3, cy - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+        for o in plan.openings:
+            cx, cy = P(o.center(plan.wall(o.wall)))
+            cv2.putText(img, o.id, (cx + 3, cy + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 3)
+            cv2.putText(img, o.id, (cx + 3, cy + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLORS["door"], 1)
     if "room" in on:
         for i, r in enumerate(plan.rooms):
             pts = np.array([P(c) for c in r.polygon])
@@ -220,6 +246,7 @@ class Session:
     runs: int = 0
     edits: list[dict] = field(default_factory=list)
     done: dict | None = None
+    feedback: FeedbackLog | None = None  # where issue reports and manual fixes are saved
 
     def run(self) -> Result:
         opts = Options(use_ai=False, user_scale=self.user_scale, params=self.params)
@@ -248,11 +275,14 @@ TOOLS = [
         "description": "Look at the input drawing (or part of it), optionally with the current reconstruction "
                        "drawn over it. Exterior walls blue, interior green, doors orange, windows magenta, rooms "
                        "outlined with id, name and area in m². The grid shows page pixel coordinates. Zoom in "
-                       "(small region) to check details such as wall ends, door swings and window positions.",
+                       "(small region) to check details such as wall ends, door swings, window positions and "
+                       "small text: a small region is enlarged up to 8x; for vector PDFs it is re-rendered "
+                       "from the PDF itself, so fine lines and text are sharp (the caption says which).",
         "input_schema": {"type": "object", "properties": {
             "region": REGION,
             "overlay": {"type": "boolean", "description": "Draw the current reconstruction over the drawing"},
-            "layers": {"type": "array", "items": {"type": "string", "enum": ["wall_ext", "wall_int", "door", "window", "room"]}},
+            "layers": {"type": "array", "items": {"type": "string", "enum": ["wall_ext", "wall_int", "door", "window", "room", "ids"]},
+                       "description": "Which layers to draw; add 'ids' to label walls and openings with their ids"},
         }, "additionalProperties": False},
     },
     {
@@ -307,10 +337,12 @@ TOOLS = [
         "description": "Fix the current reconstruction by hand where the automatic result is wrong and no "
                        "parameter fixes it. Coordinates are page pixels; sizes are mm. Actions: "
                        "add_wall {x0,y0,x1,y1 = centreline end points, thickness_mm, exterior}; "
-                       "remove_walls {region}: removes walls whose centreline midpoint is inside; "
-                       "add_opening {kind door|window|opening, x, y = centre on a wall, width_mm, "
-                       "swing_x, swing_y = a point on the side the door opens towards (doors)}; "
-                       "remove_openings {region}; rename_room {x, y = a point inside the room, name}. "
+                       "remove_walls {ids} removes whole walls, or {region} cuts out only the parts of walls "
+                       "inside the region (the rest of a long wall stays); "
+                       "add_opening {kind door|window|opening, x, y = a point on the wall's centreline at the "
+                       "opening's centre, width_mm, swing_x, swing_y = a point on the side the door opens "
+                       "towards (doors)}; remove_openings {ids} or {region}; "
+                       "rename_room {x, y = a point inside the room, name}. Use list_items to get ids. "
                        "Rooms are recomputed after wall edits. Only add what is actually drawn.",
         "input_schema": {"type": "object", "properties": {"actions": {"type": "array", "items": {
             "type": "object", "properties": {
@@ -318,18 +350,50 @@ TOOLS = [
                 "x0": {"type": "number"}, "y0": {"type": "number"}, "x1": {"type": "number"}, "y1": {"type": "number"},
                 "x": {"type": "number"}, "y": {"type": "number"}, "thickness_mm": {"type": "number"},
                 "exterior": {"type": "boolean"}, "region": REGION,
+                "ids": {"type": "array", "items": {"type": "string"}},
                 "kind": {"type": "string", "enum": ["door", "window", "opening"]}, "width_mm": {"type": "number"},
                 "swing_x": {"type": "number"}, "swing_y": {"type": "number"}, "name": {"type": "string"},
             }, "required": ["op"], "additionalProperties": False}}},
             "required": ["actions"], "additionalProperties": False},
     },
     {
+        "name": "list_items",
+        "description": "List the current walls, openings or rooms with their ids and page-pixel coordinates "
+                       "(optionally only those inside a region), to target edits precisely.",
+        "input_schema": {"type": "object", "properties": {
+            "kind": {"type": "string", "enum": ["walls", "openings", "rooms"]}, "region": REGION},
+            "required": ["kind"], "additionalProperties": False},
+    },
+    {
+        "name": "report_issue",
+        "description": "Report a shortcoming of the conversion pipeline or of these tools, for the developers "
+                       "who improve them. A crop of the drawing and of the current result around `region` is "
+                       "saved with the report. Report each distinct kind of problem once, with a tight region "
+                       "around a clear example, before you work around it. Be concrete: what the tool produced, "
+                       "what the drawing shows, and what the tool would need to do or know to get it right.",
+        "input_schema": {"type": "object", "properties": {
+            "category": {"type": "string", "enum": ["scale", "walls", "exterior", "openings", "rooms", "text",
+                                                     "vector_pdf", "tools", "other"],
+                         "description": "Pipeline area; 'tools' = these agent tools/views themselves"},
+            "region": REGION,
+            "problem": {"type": "string", "description": "What went wrong, as observed"},
+            "expected": {"type": "string", "description": "What the drawing actually shows / correct result"},
+            "suggestion": {"type": "string", "description": "How the tool could be improved to get this right"},
+            "severity": {"type": "string", "enum": ["minor", "major"]},
+        }, "required": ["category", "problem", "expected", "suggestion", "severity"], "additionalProperties": False},
+    },
+    {
         "name": "finish",
-        "description": "Stop: the reconstruction is as good as you can get it. Give an honest quality rating "
-                       "and a short summary for the user of what was done and what is still wrong.",
+        "description": "Stop: the reconstruction is as good as you can get it. Give an honest quality rating, "
+                       "a short summary for the user of what was done and what is still wrong, and feedback "
+                       "for the developers on the tools.",
         "input_schema": {"type": "object", "properties": {
             "quality": {"type": "string", "enum": ["good", "acceptable", "poor"]},
-            "summary": {"type": "string"}}, "required": ["quality", "summary"], "additionalProperties": False},
+            "summary": {"type": "string"},
+            "tool_feedback": {"type": "string", "description": "For the developers: which automatic steps failed "
+                              "on this drawing and why, which manual fixes you had to make, and which tools, "
+                              "parameters or views were missing or awkward. Prioritise what would help most."}},
+            "required": ["quality", "summary", "tool_feedback"], "additionalProperties": False},
     },
 ]
 
@@ -354,6 +418,13 @@ Work like this:
 5. Finish when walls, doors, windows and rooms match the drawing, or when further work would only be
    guessing. Never invent geometry that is not drawn; never change the scale without a measured reason.
 
+You are also the pipeline's test pilot. Its developers improve the tools from your reports: whenever you
+see the automatic conversion get something wrong (a missed or false wall, a wrong door, a window that is
+not there, a merged room, a misread label, a bad scale) or a tool is awkward to use, call report_issue
+with a tight region around a clear example before you work around it: one report per distinct kind of
+problem, not per occurrence. Your manual fixes are logged too, so make each fix a precise edit. When you
+finish, give concrete tool_feedback.
+
 Be efficient: a handful of conversion runs and targeted zooms is normally enough. Keep your messages short;
 the user sees them as a progress log."""
 
@@ -367,7 +438,7 @@ def run_tool(session: Session, name: str, args: dict) -> list[dict]:
         if overlay and res is None:
             return [{"type": "text", "text": "No conversion yet: call run_conversion first."}]
         layers = set(args["layers"]) if args.get("layers") else None
-        png, cap = render_view(res, page.gray, args.get("region"), overlay, layers)
+        png, cap = render_view(res, page.gray, args.get("region"), overlay, layers, page=page)
         return [{"type": "text", "text": cap}, _image_block(png)]
 
     if name == "run_conversion":
@@ -387,7 +458,12 @@ def run_tool(session: Session, name: str, args: dict) -> list[dict]:
             session.user_scale = {"mm_per_px": float(s)} if s else None
         t0 = time.perf_counter()
         res = session.run()
-        png, cap = render_view(res, page.gray, p.region or _plan_region(res), True)
+        if session.feedback:
+            c = checks(res)
+            session.feedback.write({"event": "run", "n": session.runs, "params": asdict(p),
+                                    "scale": c["scale"], "walls": c["walls"], "openings": c["openings"],
+                                    "problems": c["problems"]})
+        png, cap = render_view(res, page.gray, p.region or _plan_region(res), True, page=page)
         text = (f"Conversion #{session.runs} in {time.perf_counter() - t0:.1f}s with params "
                 f"{json.dumps(asdict(p), default=str)}.\nWall style: {res.walls.style}. Scale notes: "
                 f"{res.scale.notes}.\nChecks:\n{_summary(res)}")
@@ -439,15 +515,50 @@ def run_tool(session: Session, name: str, args: dict) -> list[dict]:
     if name == "edit_plan":
         if res is None:
             return [{"type": "text", "text": "No conversion yet: call run_conversion first."}]
+        fb = session.feedback
+        regions = [action_region(a) for a in args["actions"]]
+        before = [render_view(res, page.gray, r, True, page=page)[0] if fb and r else None for r in regions]
         notes = [apply_edit(res, a) for a in args["actions"]]
         session.edits += args["actions"]
         recompute_rooms(res)
-        png, cap = render_view(res, page.gray, session.params.region or _plan_region(res), True)
+        if fb:  # every manual fix is evidence of something the pipeline got wrong
+            for a, r, b, note in zip(args["actions"], regions, before, notes):
+                rec = {"event": "edit", "action": a, "note": note, "region": r}
+                if r:
+                    rec["before_png"] = fb.image(b, "edit_before")
+                    rec["after_png"] = fb.image(render_view(res, page.gray, r, True, page=page)[0], "edit_after")
+                fb.write(rec)
+        png, cap = render_view(res, page.gray, session.params.region or _plan_region(res), True, page=page)
         return [{"type": "text", "text": "\n".join(notes) + "\nChecks after edits:\n" + _summary(res)},
                 {"type": "text", "text": cap}, _image_block(png)]
 
+    if name == "list_items":
+        if res is None:
+            return [{"type": "text", "text": "No conversion yet: call run_conversion first."}]
+        return [{"type": "text", "text": list_items(res, args["kind"], args.get("region"))}]
+
+    if name == "report_issue":
+        fb = session.feedback
+        rec = {"event": "issue", **args}
+        if fb is None:
+            return [{"type": "text", "text": "Noted (feedback is not being saved in this session)."}]
+        if args.get("region"):
+            r = pad(args["region"], 40)
+            rec["input_png"] = fb.image(render_view(None, page.gray, r, False, page=page)[0], "issue_drawing")
+            if res is not None:
+                rec["result_png"] = fb.image(render_view(res, page.gray, r, True, page=page)[0], "issue_result")
+        fb.write(rec)
+        return [{"type": "text", "text": "Reported, with crops of the drawing and the current result. Continue."}]
+
     if name == "finish":
         session.done = args
+        if session.feedback:
+            c = checks(res) if res is not None else {}
+            session.feedback.write({"event": "finish", **args, "runs": session.runs, "edits": len(session.edits),
+                                    "final_problems": c.get("problems"), "rooms": c.get("rooms")})
+            if res is not None:
+                region = session.params.region or _plan_region(res)
+                session.feedback.image(render_view(res, page.gray, region, True, page=page)[0], "final_result")
         return [{"type": "text", "text": "Finished."}]
     return [{"type": "text", "text": f"Unknown tool {name}"}]
 
@@ -463,6 +574,44 @@ def _plan_region(res: Result):
 # --- manual edits ----------------------------------------------------------------------------------
 
 
+def _new_id(prefix: str, taken) -> str:
+    """A fresh id: ids are never reused, even after removals (openings refer to walls by id)."""
+    ids = set(taken)
+    i = len(ids)
+    while f"{prefix}{i}" in ids:
+        i += 1
+    return f"{prefix}{i}"
+
+
+def _mm_box(res: Result, region) -> Polygon:
+    (ax, ay), (bx, by) = res.to_mm(region[0], region[1]), res.to_mm(region[2], region[3])
+    return Polygon([(ax, ay), (bx, ay), (bx, by), (ax, by)])
+
+
+def _cut_wall(plan, wall: Wall, box: Polygon) -> int:
+    """Remove the part of `wall` inside `box`, keeping the rest as new walls; returns pieces kept."""
+    line = LineString([wall.a, wall.b])
+    rest = line.difference(box)
+    pieces = [g for g in getattr(rest, "geoms", [rest]) if not g.is_empty and g.length > wall.thickness]
+    ops = [o for o in plan.openings if o.wall == wall.id]
+    plan.walls.remove(wall)
+    plan.openings = [o for o in plan.openings if o.wall != wall.id]
+    for g in pieces:
+        p, q = g.coords[0], g.coords[-1]
+        if line.project(Point(p)) > line.project(Point(q)):  # keep the original direction
+            p, q = q, p
+        nw = Wall(_new_id("A", (w.id for w in plan.walls)), (r5(p[0]), r5(p[1])), (r5(q[0]), r5(q[1])),
+                  wall.thickness, wall.exterior)
+        plan.walls.append(nw)
+        start = line.project(Point(p))
+        for o in ops:
+            c = Point(o.center(wall))
+            if not box.contains(c) and g.distance(c) < 1:
+                o.wall, o.offset = nw.id, o.offset - start
+                plan.openings.append(o)
+    return len(pieces)
+
+
 def apply_edit(res: Result, a: dict) -> str:
     plan = res.plan
     op = a.get("op")
@@ -476,45 +625,57 @@ def apply_edit(res: Result, a: dict) -> str:
             elif abs(p1[1] - p0[1]) < abs(p1[0] - p0[0]) * 0.05:
                 p1 = (p1[0], p0[1])
             p0, p1 = (r5(p0[0]), r5(p0[1])), (r5(p1[0]), r5(p1[1]))
-            wid = f"A{len(plan.walls)}"
+            wid = _new_id("A", (w.id for w in plan.walls))
             plan.walls.append(Wall(wid, p0, p1, float(a.get("thickness_mm", 95)), bool(a.get("exterior", False))))
             return f"added wall {wid} {p0}->{p1} mm"
         if op == "remove_walls":
-            region = a["region"]
-            gone = {w.id for w in plan.walls
-                    if _inside(region, res.to_px((w.a[0] + w.b[0]) / 2, (w.a[1] + w.b[1]) / 2))}
-            plan.walls = [w for w in plan.walls if w.id not in gone]
-            plan.openings = [o for o in plan.openings if o.wall not in gone]
-            return f"removed {len(gone)} walls"
+            if a.get("ids"):
+                gone = set(a["ids"]) & {w.id for w in plan.walls}
+                plan.walls = [w for w in plan.walls if w.id not in gone]
+                plan.openings = [o for o in plan.openings if o.wall not in gone]
+                return f"removed walls {sorted(gone)}"
+            # Cut out only what lies inside the region; parts of long walls outside it stay.
+            box = _mm_box(res, a["region"])
+            hit = [w for w in plan.walls if LineString([w.a, w.b]).intersects(box)]
+            kept = sum(_cut_wall(plan, w, box) for w in hit)
+            return f"cut {len(hit)} walls inside the region ({kept} remaining pieces kept outside it)"
         if op == "add_opening":
             pt = Point(res.to_mm(a["x"], a["y"]))
             wall = min(plan.walls, key=lambda w: LineString([w.a, w.b]).distance(pt))
             line = LineString([wall.a, wall.b])
-            if line.distance(pt) > wall.thickness + 300:
-                return "add_opening: no wall near that point"
+            if line.distance(pt) > wall.thickness / 2 + 150:
+                return "add_opening: no wall at that point (put x, y on a wall's centreline)"
             offset = line.project(pt)
+            width = float(a.get("width_mm", 910))
+            if offset - width / 2 < -wall.thickness / 2 or offset + width / 2 > wall.length + wall.thickness / 2:
+                return f"add_opening: a {width:.0f} mm opening does not fit on wall {wall.id} at that point"
             swing = 1
             if "swing_x" in a and "swing_y" in a:
                 sx, sy = res.to_mm(a["swing_x"], a["swing_y"])
                 ux, uy = wall.direction
                 swing = 1 if (-uy * (sx - wall.a[0]) + ux * (sy - wall.a[1])) >= 0 else -1
-            plan.openings.append(Opening(f"E{len(plan.openings)}", a.get("kind", "door"), wall.id, r5(offset),
-                                         float(a.get("width_mm", 910)), swing=swing))
-            return f"added {a.get('kind', 'door')} on wall {wall.id}"
+            oid = _new_id("E", (o.id for o in plan.openings))
+            plan.openings.append(Opening(oid, a.get("kind", "door"), wall.id, r5(offset), width, swing=swing))
+            cx, cy = res.to_px(*wall.point_at(offset))
+            return f"added {a.get('kind', 'door')} {oid} on wall {wall.id}, centre at page px ({cx:.0f}, {cy:.0f})"
         if op == "remove_openings":
-            region = a["region"]
             before = len(plan.openings)
-            plan.openings = [o for o in plan.openings
-                             if not _inside(region, res.to_px(*o.center(plan.wall(o.wall))))]
+            if a.get("ids"):
+                plan.openings = [o for o in plan.openings if o.id not in set(a["ids"])]
+            else:
+                region = a["region"]
+                plan.openings = [o for o in plan.openings
+                                 if not _inside(region, res.to_px(*o.center(plan.wall(o.wall))))]
             return f"removed {before - len(plan.openings)} openings"
         if op == "rename_room":
-            pt = Point(res.to_mm(a["x"], a["y"]))
+            pt = res.to_mm(a["x"], a["y"])
+            # Anchored to the point given, so the name survives rooms being recomputed after wall edits.
+            plan.meta.setdefault("room_names", []).append((pt, a["name"].upper()))
             for r in plan.rooms:
-                if Polygon(r.polygon).contains(pt):
+                if Polygon(r.polygon).contains(Point(pt)):
                     r.name = a["name"].upper()
-                    r.name_fixed = True  # type: ignore[attr-defined]
                     return f"renamed room to {r.name}"
-            return "rename_room: no room at that point"
+            return "rename_room: no room at that point yet (the name will apply once one encloses it)"
     except (KeyError, ValueError) as e:
         return f"{op}: missing or bad argument {e}"
     return f"unknown edit {op}"
@@ -522,16 +683,38 @@ def apply_edit(res: Result, a: dict) -> str:
 
 def recompute_rooms(res: Result) -> None:
     plan = res.plan
-    fixed = [(Polygon(r.polygon).representative_point(), r.name) for r in plan.rooms
-             if getattr(r, "name_fixed", False)]
     plan.rooms, plan.dims = [], []
     add_rooms(plan, res)
     add_dimensions(plan)
-    for pt, name in fixed:  # keep names the agent set
+    for pt, name in plan.meta.get("room_names", []):  # names the agent set, at the points it gave
         for r in plan.rooms:
-            if Polygon(r.polygon).contains(pt):
+            if Polygon(r.polygon).contains(Point(pt)):
                 r.name = name
-                r.name_fixed = True  # type: ignore[attr-defined]
+
+
+def list_items(res: Result, kind: str, region=None) -> str:
+    plan = res.plan
+    px = lambda p: f"({res.to_px(*p)[0]:.0f}, {res.to_px(*p)[1]:.0f})"
+    rows = []
+    if kind == "walls":
+        for w in plan.walls:
+            mid = res.to_px((w.a[0] + w.b[0]) / 2, (w.a[1] + w.b[1]) / 2)
+            if region and not _inside(region, mid):
+                continue
+            rows.append(f"{w.id}: {px(w.a)} -> {px(w.b)}, {w.thickness:.0f} mm, "
+                        f"{'exterior' if w.exterior else 'interior'}, {w.length / 1000:.2f} m")
+    elif kind == "openings":
+        for o in plan.openings:
+            c = o.center(plan.wall(o.wall))
+            if region and not _inside(region, res.to_px(*c)):
+                continue
+            rows.append(f"{o.id}: {o.kind} {o.width:.0f} mm on wall {o.wall}, centre {px(c)}"
+                        + (f", swings {'left' if o.swing > 0 else 'right'} of the wall direction" if o.kind == "door" else ""))
+    else:
+        for i, r in enumerate(plan.rooms):
+            c = Polygon(r.polygon).representative_point()
+            rows.append(f"R{i}: {r.name}, {Polygon(r.polygon).area / 1e6:.1f} m², label point {px((c.x, c.y))}")
+    return f"{len(rows)} {kind}" + (" in region" if region else "") + ":\n" + "\n".join(rows)
 
 
 # --- the loop --------------------------------------------------------------------------------------
@@ -608,6 +791,8 @@ def run_agent(prep: Prepared, on_event: Event | None = None, max_turns: int = MA
     session.usage = usage  # type: ignore[attr-defined]
     # Opus 5.5: $4 / $20 per MTok, cache reads $0.20 (cache writes counted as plain input: a slight underestimate)
     cost = usage["input"] * 4e-6 + usage["output"] * 20e-6 + usage["cache_read"] * 0.2e-6
+    if session.feedback:
+        session.feedback.write({"event": "usage", "backend": "api", "usage": usage, "cost_usd": round(cost, 2)})
     emit({"type": "done", "summary": (session.done or {}).get("summary", "Stopped at the turn limit."),
           "quality": (session.done or {}).get("quality", "unknown"), "usage": usage, "cost_usd": round(cost, 2)})
     return session
@@ -629,7 +814,9 @@ def main() -> None:
         elif e["type"] == "done":
             print(f"done ({e['quality']}, ~${e['cost_usd']}): {e['summary']}")
 
-    s = run_agent(prep, show, args.max_turns)
+    fb = FeedbackLog(args.input.name, "api")
+    s = run_agent(prep, show, args.max_turns, session=Session(prep, feedback=fb))
+    print("feedback saved in", fb.dir)
     plan_to_dxf(s.result.plan, args.output)
     png, _ = render_view(s.result, prep.page.gray, s.params.region or _plan_region(s.result), True)
     args.output.with_suffix(".png").write_bytes(png)

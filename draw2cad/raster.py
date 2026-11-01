@@ -45,13 +45,18 @@ class Page:
     pages: int = 1
     # Vector PDFs: stroked linework as (pen width in pt, N x 2 points in page px).
     vectors: list[tuple[float, np.ndarray]] = field(default_factory=list)
+    # PDFs: the document itself, so any region can be re-rendered sharply (see render_region).
+    pdf: bytes | None = None
+    pdf_index: int = 0
+    px_per_pt: float = 1.0  # page px per PDF point
 
 
 def load(data: bytes, filename: str, page: int = 0) -> Page:
     vectors: list[tuple[float, np.ndarray]] = []
+    pdf, px_per_pt = None, 1.0
     if data[:5] == b"%PDF-" or filename.lower().endswith(".pdf"):
         gray, dpi, paper, words, pages, vectors = _load_pdf(data, page)
-        source = "pdf"
+        source, pdf, px_per_pt = "pdf", data, dpi / 72
     else:
         gray, dpi = _load_image(data)
         paper, words, pages, source = None, [], 1, "image"
@@ -61,13 +66,33 @@ def load(data: bytes, filename: str, page: int = 0) -> Page:
         dpi = dpi * scale if dpi else None
         words = [Word(w.text, tuple(v * scale for v in w.box), w.conf, w.vertical) for w in words]
         vectors = [(w, pts * scale) for w, pts in vectors]
+        px_per_pt *= scale
     gray = normalize_background(gray)
     skew = estimate_skew(gray)
     if abs(skew) > 0.05:
         gray, words = rotate(gray, words, skew)
         vectors = []  # a rotated vector PDF is rare; fall back to the raster rather than transform
+        pdf = None
     return Page(gray=gray, ink=binarize(gray), dpi=dpi, paper_mm=paper, words=words, skew_deg=skew,
-                source=source, pages=pages, vectors=vectors)
+                source=source, pages=pages, vectors=vectors, pdf=pdf, pdf_index=page, px_per_pt=px_per_pt)
+
+
+def render_region(page: Page, box: tuple[int, int, int, int], zoom: float) -> np.ndarray | None:
+    """Grey image of page px box (x0, y0, x1, y1) at `zoom` output px per page px, rendered from the
+    PDF's vectors (real detail, not an enlarged raster). None if the page is not a usable PDF."""
+    if page.pdf is None:
+        return None
+    import pymupdf
+
+    x0, y0, x1, y1 = box
+    doc = pymupdf.open(stream=page.pdf, filetype="pdf")
+    pg = doc[min(page.pdf_index, len(doc) - 1)]
+    k = page.px_per_pt
+    clip = pymupdf.Rect(x0 / k, y0 / k, x1 / k, y1 / k)
+    pix = pg.get_pixmap(clip=clip, dpi=max(72, int(round(72 * k * zoom))), colorspace=pymupdf.csGRAY, alpha=False)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+    w, h = int(round((x1 - x0) * zoom)), int(round((y1 - y0) * zoom))
+    return cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA) if (img.shape[1], img.shape[0]) != (w, h) else img.copy()
 
 
 def _load_pdf(data: bytes, index: int):
